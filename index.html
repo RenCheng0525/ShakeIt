@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <style>
+        body {
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background: #000;
+        }
+
+        .canvas-container {
+            position: relative;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 80px;
+            /* Space reserved for control panel */
+        }
+
+        #canvas,
+        #overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: auto;
+            touch-action: none;
+        }
+
+        .controls {
+            position: fixed;
+            bottom: 0;
+            width: 100%;
+            background: white;
+            padding: 20px;
+            box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.1);
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .active {
+            background: #2563eb;
+            color: white;
+        }
+
+        .inactive {
+            background: #e5e7eb;
+            color: #374151;
+        }
+
+        #imageInput {
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="canvas-container">
+        <canvas id="canvas"></canvas>
+        <canvas id="overlay"></canvas>
+    </div>
+    <div class="controls">
+        <button id="drawMode" class="active">✏️ Draw Mode</button>
+        <button id="shakeMode" class="inactive">🌊 Shake Mode</button>
+        <div style="width: 20px;"></div>
+        <button id="clear" style="background: #ef4444; color: white;">🗑️ Clear All</button>
+        <button id="loadImage" style="background: #10b981; color: white;">📷 Load Image</button>
+        <button id="fullscreenBtn" style="background: #6366f1; color: white;">📺 Fullscreen</button>
+        <input type="file" id="imageInput" accept="image/*">
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.8.1/gl-matrix-min.js"></script>
+
+    <script>
+        // === Basic Variable Initialization ===
+        const canvas = document.getElementById('canvas');
+        const overlay = document.getElementById('overlay');
+        const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true });
+        const ctx = overlay.getContext('2d');
+
+        const isDebugMode = false;
+
+        // Drawing state variables
+        let mode = 'draw';
+        let isDrawing = false;
+        let circles = [];
+        let startPos = { x: 0, y: 0 };
+        let currentPos = { x: 0, y: 0 };
+        let isDragging = false;
+
+        // Image-related variables
+        let currentTexture = null;
+        let backgroundImage = null;
+
+        // === Vertex Shader Source ===
+        const vsSource = `
+            attribute vec4 aVertexPosition;
+            attribute vec2 aTextureCoord;
+            uniform mat4 uModelViewMatrix;
+            uniform mat4 uProjectionMatrix;
+            varying highp vec2 vTextureCoord;
+        
+            void main(void) {
+                gl_Position = uProjectionMatrix * uModelViewMatrix * aVertexPosition;
+                vTextureCoord = aTextureCoord;
+            }
+        `;
+
+        // === Fragment Shader Source ===
+        const fsSource = `
+        precision mediump float;
+        
+        varying highp vec2 vTextureCoord;
+        uniform sampler2D uSampler;
+        
+        const int MAX_CIRCLES = 10;
+        uniform vec2 uCenters[MAX_CIRCLES];  // Circle centers
+        uniform float uRadii[MAX_CIRCLES];   // Circle radii
+        uniform vec2 uForces[MAX_CIRCLES];   // Distortion directions
+        uniform int uCircleCount;            // Number of circles
+        
+        void main(void) {
+            vec2 pos = vTextureCoord;
+            vec2 displacement = vec2(0.0);
+        
+            for (int i = 0; i < MAX_CIRCLES; i++) {
+                if (i >= uCircleCount) break;
+                
+                vec2 pixelPos = pos * 2.0 - 1.0;
+                vec2 toCenter = pixelPos - uCenters[i];
+                float dist = length(toCenter);
+                float influence = smoothstep(uRadii[i], 0.0, dist);
+                displacement += uForces[i] * influence;
+            }
+        
+            displacement *= 0.5;
+            vec2 distortedCoord = pos + displacement;
+            distortedCoord = clamp(distortedCoord, 0.0, 1.0);
+            gl_FragColor = texture2D(uSampler, distortedCoord);
+        }
+        `;
+
+        // === Coordinate and Size Calculation Functions ===
+        function getMousePosition(e) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+
+            return {
+                x: (e.clientX - rect.left) * scaleX,
+                y: (e.clientY - rect.top) * scaleY
+            };
+        }
+
+        function calculateOptimalCanvasSize(image) {
+            // Get container dimensions instead of window
+            const container = document.querySelector('.canvas-container');
+            const maxWidth = document.fullscreenElement ?
+                container.clientWidth :
+                window.innerWidth * 0.9;
+            const maxHeight = document.fullscreenElement ?
+                container.clientHeight :
+                window.innerHeight * 0.8;
+
+            let optimalWidth = image.width;
+            let optimalHeight = image.height;
+
+            if (optimalWidth > maxWidth || optimalHeight > maxHeight) {
+                const ratio = Math.min(maxWidth / optimalWidth, maxHeight / optimalHeight);
+                optimalWidth *= ratio;
+                optimalHeight *= ratio;
+            }
+
+            return {
+                width: Math.round(optimalWidth),
+                height: Math.round(optimalHeight)
+            };
+        }
+
+        // === Canvas Adjustment and Image Loading ===
+        function resizeCanvas() {
+            if (!backgroundImage) return;
+
+            // Store original dimensions for scale calculation
+            const oldWidth = canvas.width;
+            const oldHeight = canvas.height;
+
+            // Calculate new dimensions
+            const size = calculateOptimalCanvasSize(backgroundImage);
+            const newWidth = size.width;
+            const newHeight = size.height;
+
+            // Calculate scaling factors for width and height
+            const scaleX = newWidth / oldWidth;
+            const scaleY = newHeight / oldHeight;
+
+            // Update all existing circles
+            circles.forEach(circle => {
+                // Scale position coordinates
+                circle.x *= scaleX;
+                circle.y *= scaleY;
+
+                // Scale radius (using the smaller scale to maintain circle shape)
+                const scale = Math.min(scaleX, scaleY);
+                circle.radius *= scale;
+
+                // Reset any active distortions
+                circle.offsetX = 0;
+                circle.offsetY = 0;
+            });
+
+            // Update canvas dimensions
+            canvas.width = newWidth;
+            canvas.height = newHeight;
+            overlay.width = newWidth;
+            overlay.height = newHeight;
+
+            // Update WebGL viewport
+            gl.viewport(0, 0, newWidth, newHeight);
+
+            // Clean up and redraw
+            if (currentTexture) {
+                gl.deleteTexture(currentTexture);
+            }
+            drawBackground();
+        }
+
+        function loadImage(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const image = new Image();
+                    image.onload = () => {
+                        backgroundImage = image;
+                        resizeCanvas();
+                        circles = [];
+                        resolve();
+                    };
+                    image.onerror = reject;
+                    image.src = event.target.result;
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        // === WebGL Initialization Functions ===
+        function initShaderProgram(gl, vsSource, fsSource) {
+            const vertexShader = loadShader(gl, gl.VERTEX_SHADER, vsSource);
+            const fragmentShader = loadShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+            const shaderProgram = gl.createProgram();
+            gl.attachShader(shaderProgram, vertexShader);
+            gl.attachShader(shaderProgram, fragmentShader);
+            gl.linkProgram(shaderProgram);
+
+            if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {
+                console.error('Unable to initialize shader program: ' + gl.getProgramInfoLog(shaderProgram));
+                return null;
+            }
+
+            return shaderProgram;
+        }
+
+        function loadShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('Shader compilation error: ' + gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+
+            return shader;
+        }
+
+        // Initialize WebGL program and attribute locations
+        const shaderProgram = initShaderProgram(gl, vsSource, fsSource);
+        const programInfo = {
+            program: shaderProgram,
+            attribLocations: {
+                vertexPosition: gl.getAttribLocation(shaderProgram, 'aVertexPosition'),
+                textureCoord: gl.getAttribLocation(shaderProgram, 'aTextureCoord'),
+            },
+            uniformLocations: {
+                projectionMatrix: gl.getUniformLocation(shaderProgram, 'uProjectionMatrix'),
+                modelViewMatrix: gl.getUniformLocation(shaderProgram, 'uModelViewMatrix'),
+                uSampler: gl.getUniformLocation(shaderProgram, 'uSampler'),
+                uCenters: gl.getUniformLocation(shaderProgram, 'uCenters'),
+                uRadii: gl.getUniformLocation(shaderProgram, 'uRadii'),
+                uForces: gl.getUniformLocation(shaderProgram, 'uForces'),
+                uCircleCount: gl.getUniformLocation(shaderProgram, 'uCircleCount'),
+            },
+        };
+
+        // Initialize WebGL state
+        gl.clearColor(0.0, 0.0, 0.0, 1.0);
+        gl.enable(gl.DEPTH_TEST);
+        gl.depthFunc(gl.LEQUAL);
+
+        window.addEventListener('resize', () => {
+            resizeCanvas();
+        });
+
+        // === Mesh Generation and Buffer Management ===
+        function createMesh(subdivisions = 30) {
+            const positions = [];
+            const textureCoords = [];
+            const indices = [];
+
+            // Generate vertices and texture coordinates
+            for (let y = 0; y <= subdivisions; y++) {
+                for (let x = 0; x <= subdivisions; x++) {
+                    const xPos = (x / subdivisions) * 2 - 1;
+                    const yPos = (y / subdivisions) * 2 - 1;
+                    positions.push(xPos, yPos);
+
+                    const u = x / subdivisions;
+                    const v = 1.0 - (y / subdivisions);
+                    textureCoords.push(u, v);
+                }
+            }
+
+            // Generate triangle indices
+            for (let y = 0; y < subdivisions; y++) {
+                for (let x = 0; x < subdivisions; x++) {
+                    const i = y * (subdivisions + 1) + x;
+                    indices.push(
+                        i, i + 1, i + subdivisions + 1,
+                        i + 1, i + subdivisions + 2, i + subdivisions + 1
+                    );
+                }
+            }
+
+            return {
+                positions: new Float32Array(positions),
+                textureCoords: new Float32Array(textureCoords),
+                indices: new Uint16Array(indices),
+            };
+        }
+
+        // === Buffer Initialization and Management ===
+        const buffers = {
+            position: gl.createBuffer(),
+            textureCoord: gl.createBuffer(),
+            indices: gl.createBuffer(),
+        };
+
+        function initBuffers(mesh) {
+            // Vertex position buffer
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffers.position);
+            gl.bufferData(gl.ARRAY_BUFFER, mesh.positions, gl.STATIC_DRAW);
+
+            // Texture coordinate buffer
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffers.textureCoord);
+            gl.bufferData(gl.ARRAY_BUFFER, mesh.textureCoords, gl.STATIC_DRAW);
+
+            // Index buffer
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffers.indices);
+            gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
+        }
+
+        // === Texture Processing ===
+        function isPowerOf2(value) {
+            return (value & (value - 1)) === 0;
+        }
+
+        function loadTexture(gl, image) {
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+
+            // Upload image to GPU
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+
+            // Set texture parameters
+            if (isPowerOf2(image.width) && isPowerOf2(image.height)) {
+                gl.generateMipmap(gl.TEXTURE_2D);
+            } else {
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            }
+
+            return texture;
+        }
+
+        // Initialize basic mesh
+        let mesh = createMesh();
+        initBuffers(mesh);
+
+        // === Drawing and Rendering Functions ===
+        function drawBackground() {
+            if (!backgroundImage) return;
+
+            if (currentTexture) {
+                gl.deleteTexture(currentTexture);
+            }
+
+            currentTexture = loadTexture(gl, backgroundImage);
+
+            gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        }
+
+        function drawScene() {
+            if (!currentTexture) return;
+
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            gl.useProgram(programInfo.program);
+
+            // Set matrices
+            const projectionMatrix = mat4.create();
+            const modelViewMatrix = mat4.create();
+
+            gl.uniformMatrix4fv(
+                programInfo.uniformLocations.projectionMatrix,
+                false,
+                projectionMatrix
+            );
+            gl.uniformMatrix4fv(
+                programInfo.uniformLocations.modelViewMatrix,
+                false,
+                modelViewMatrix
+            );
+
+            // Bind texture
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, currentTexture);
+            gl.uniform1i(programInfo.uniformLocations.uSampler, 0);
+
+            // Set circle data
+            let centers = [];
+            let radii = [];
+            let forces = [];
+
+            circles.forEach(circle => {
+                centers.push((circle.x / canvas.width) * 2 - 1);
+                centers.push((circle.y / canvas.height) * 2 - 1);
+                radii.push((circle.radius / Math.min(canvas.width, canvas.height)) * 2);
+                forces.push((circle.offsetX / canvas.width) * 2);
+                forces.push((circle.offsetY / canvas.height) * 2);
+            });
+
+            // Fill remaining array slots
+            while (centers.length < 20) centers.push(0);
+            while (radii.length < 10) radii.push(0);
+            while (forces.length < 20) forces.push(0);
+
+            // Pass data to WebGL
+            gl.uniform2fv(programInfo.uniformLocations.uCenters, new Float32Array(centers));
+            gl.uniform1fv(programInfo.uniformLocations.uRadii, new Float32Array(radii));
+            gl.uniform2fv(programInfo.uniformLocations.uForces, new Float32Array(forces));
+            gl.uniform1i(programInfo.uniformLocations.uCircleCount, circles.length);
+
+            // Set vertex attributes
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffers.position);
+            gl.vertexAttribPointer(
+                programInfo.attribLocations.vertexPosition,
+                2, gl.FLOAT, false, 0, 0
+            );
+            gl.enableVertexAttribArray(programInfo.attribLocations.vertexPosition);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, buffers.textureCoord);
+            gl.vertexAttribPointer(
+                programInfo.attribLocations.textureCoord,
+                2, gl.FLOAT, false, 0, 0
+            );
+            gl.enableVertexAttribArray(programInfo.attribLocations.textureCoord);
+
+            // Draw
+            gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buffers.indices);
+            gl.drawElements(gl.TRIANGLES, mesh.indices.length, gl.UNSIGNED_SHORT, 0);
+        }
+
+        // === 2D Canvas Update ===
+        function updateOverlay() {
+            ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+            if (mode === 'draw') {
+                // Draw existing circles
+                circles.forEach((circle) => {
+                    ctx.beginPath();
+                    ctx.arc(circle.x, circle.y, circle.radius, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(255, 0, 0, 0.8)';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                });
+
+                // Draw preview circle
+                if (isDrawing) {
+                    const radius = Math.sqrt(
+                        Math.pow(currentPos.x - startPos.x, 2) +
+                        Math.pow(currentPos.y - startPos.y, 2)
+                    );
+
+                    ctx.beginPath();
+                    ctx.arc(startPos.x, startPos.y, radius, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(255, 0, 0, 0.5)';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+            }
+        }
+
+        // === Event Handlers and Animation Loop ===
+        const container = document.querySelector('.canvas-container');
+
+        // Mouse event handlers
+        container.addEventListener('mousedown', (e) => {
+            if (!backgroundImage) return;
+
+            const pos = getMousePosition(e);
+
+            if (mode === 'draw') {
+                isDrawing = true;
+                startPos = pos;
+                currentPos = pos;
+            } else if (mode === 'shake') {
+                isDragging = true;
+                startPos = pos;
+            }
+        });
+
+        container.addEventListener('mousemove', (e) => {
+            if (!backgroundImage) return;
+
+            const pos = getMousePosition(e);
+            currentPos = pos;
+
+            if (mode === 'draw' && isDrawing) {
+                console.log('Drawing, current position:', currentPos);
+                const radius = Math.sqrt(
+                    Math.pow(currentPos.x - startPos.x, 2) +
+                    Math.pow(currentPos.y - startPos.y, 2)
+                );
+                console.log('Current radius:', radius);
+            } else if (mode === 'shake' && isDragging) {
+                const mouseDx = pos.x - startPos.x;
+                const mouseDy = pos.y - startPos.y;
+
+                circles.forEach(circle => {
+                    circle.offsetX = mouseDx * 0.5;
+                    circle.offsetY = mouseDy * 0.5;
+
+                    const maxOffset = circle.radius * 0.5;
+                    circle.offsetX = Math.max(-maxOffset, Math.min(maxOffset, circle.offsetX));
+                    circle.offsetY = Math.max(-maxOffset, Math.min(maxOffset, circle.offsetY));
+                });
+
+                startPos = pos;
+            }
+        });
+
+        container.addEventListener('mouseup', () => {
+            if (mode === 'draw' && isDrawing && backgroundImage) {
+                const radius = Math.sqrt(
+                    Math.pow(currentPos.x - startPos.x, 2) +
+                    Math.pow(currentPos.y - startPos.y, 2)
+                );
+
+                if (radius > 5) {
+                    circles.push({
+                        x: startPos.x,
+                        y: startPos.y,
+                        radius: radius,
+                        offsetX: 0,
+                        offsetY: 0
+                    });
+                }
+            }
+
+            isDrawing = false;
+            isDragging = false;
+        });
+
+        // Touch event handlers
+        function getTouchPosition(e) {
+            const touch = e.touches[0] || e.changedTouches[0];
+            return getMousePosition(touch);
+        }
+
+        container.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            if (!backgroundImage) return;
+
+            const pos = getTouchPosition(e);
+
+            if (mode === 'draw') {
+                isDrawing = true;
+                startPos = pos;
+                currentPos = pos;
+            } else if (mode === 'shake') {
+                isDragging = true;
+                startPos = pos;
+            }
+        }, { passive: false });
+
+        container.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+            if (!backgroundImage) return;
+
+            const pos = getTouchPosition(e);
+            currentPos = pos;
+
+            if (mode === 'draw' && isDrawing) {
+                console.log('Touch drawing, current position:', currentPos);
+            } else if (mode === 'shake' && isDragging) {
+                const dx = pos.x - startPos.x;
+                const dy = pos.y - startPos.y;
+
+                circles.forEach(circle => {
+                    circle.offsetX = dx * 0.5;
+                    circle.offsetY = dy * 0.5;
+
+                    const maxOffset = circle.radius * 0.5;
+                    circle.offsetX = Math.max(-maxOffset, Math.min(maxOffset, circle.offsetX));
+                    circle.offsetY = Math.max(-maxOffset, Math.min(maxOffset, circle.offsetY));
+                });
+
+                startPos = pos;
+            }
+        }, { passive: false });
+
+        container.addEventListener('touchend', (e) => {
+            e.preventDefault();
+            if (mode === 'draw' && isDrawing && backgroundImage) {
+                const radius = Math.sqrt(
+                    Math.pow(currentPos.x - startPos.x, 2) +
+                    Math.pow(currentPos.y - startPos.y, 2)
+                );
+
+                if (radius > 5) {
+                    circles.push({
+                        x: startPos.x,
+                        y: startPos.y,
+                        radius: radius,
+                        offsetX: 0,
+                        offsetY: 0
+                    });
+                }
+            }
+
+            isDrawing = false;
+            isDragging = false;
+        }, { passive: false });
+
+        // === Physics Update and Animation Loop ===
+        function updatePhysics() {
+            circles.forEach(circle => {
+                if (!circle.isDragging) {
+                    // Apply spring effect
+                    circle.offsetX *= 0.9;
+                    circle.offsetY *= 0.9;
+                }
+            });
+        }
+
+        function animate() {
+            if (mode === 'shake') {
+                updatePhysics();
+            }
+            drawScene();
+            updateOverlay();
+            requestAnimationFrame(animate);
+        }
+
+        // === Debug Panel ===
+        function createDebugPanel() {
+            if (!isDebugMode) return null;
+
+            const panel = document.createElement('div');
+            panel.style.cssText = `
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        background: rgba(0,0,0,0.7);
+        color: white;
+        padding: 10px;
+        border-radius: 5px;
+        font-family: monospace;
+        z-index: 9999;
+    `;
+
+            const content = document.createElement('pre');
+            panel.appendChild(content);
+            document.body.appendChild(panel);
+
+            return {
+                update: (data) => {
+                    content.textContent = Object.entries(data)
+                        .map(([key, value]) => `${key}: ${value}`)
+                        .join('\n');
+                }
+            };
+        }
+
+        const debugPanel = createDebugPanel();
+
+        // === Device Motion Handling ===
+        function handleMotion(event) {
+            if (mode !== 'shake') return;
+
+            const acc = event.acceleration || event.accelerationIncludingGravity;
+            if (!acc) return;
+
+            if (debugPanel) {
+                debugPanel.update({
+                    'Acceleration X': acc.x.toFixed(2),
+                    'Acceleration Y': acc.y.toFixed(2),
+                    'Acceleration Z': acc.z.toFixed(2),
+                    'Circles Count': circles.length,
+                    'Mode': mode,
+                    'Max Offset': circles[0] ? circles[0].radius * 0.5 : 0
+                });
+            }
+
+            const forceFactor = 10;
+            const dx = acc.x * forceFactor;
+            const dy = acc.y * forceFactor;
+
+            circles.forEach(circle => {
+                circle.offsetX += dx;
+                circle.offsetY += dy;
+
+                const maxOffset = circle.radius * 0.5;
+                circle.offsetX = Math.max(-maxOffset, Math.min(maxOffset, circle.offsetX));
+                circle.offsetY = Math.max(-maxOffset, Math.min(maxOffset, circle.offsetY));
+            });
+        }
+
+        // === Button Event Handlers ===
+        async function requestMotionPermission() {
+            if (typeof DeviceMotionEvent.requestPermission === 'function') {
+                try {
+                    const permissionState = await DeviceMotionEvent.requestPermission();
+                    if (permissionState === 'granted') {
+                        window.addEventListener('devicemotion', handleMotion, true);
+                    } else {
+                        alert('Motion sensor access denied');
+                    }
+                } catch (error) {
+                    alert('Please enable motion sensor access in settings');
+                }
+            } else {
+                window.addEventListener('devicemotion', handleMotion, true);
+            }
+        }
+
+        // Button click handlers
+        document.getElementById('drawMode').addEventListener('click', () => {
+            mode = 'draw';
+            document.getElementById('drawMode').className = 'active';
+            document.getElementById('shakeMode').className = 'inactive';
+
+            circles.forEach(circle => {
+                circle.offsetX = 0;
+                circle.offsetY = 0;
+            });
+        });
+
+        document.getElementById('shakeMode').addEventListener('click', () => {
+            mode = 'shake';
+            document.getElementById('shakeMode').className = 'active';
+            document.getElementById('drawMode').className = 'inactive';
+            requestMotionPermission();
+        });
+
+        document.getElementById('clear').addEventListener('click', () => {
+            circles = [];
+            drawScene();
+            updateOverlay();
+            window.removeEventListener('devicemotion', handleMotion);
+        });
+
+        document.getElementById('loadImage').addEventListener('click', () => {
+            document.getElementById('imageInput').click();
+        });
+
+        document.getElementById('imageInput').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                try {
+                    circles = [];
+                    await loadImage(file);
+                    drawBackground();
+                    console.log('Image loaded successfully');
+                } catch (error) {
+                    console.error('Failed to load image:', error);
+                }
+            }
+        });
+
+        // Fullscreen functionality
+        document.getElementById('fullscreenBtn').addEventListener('click', () => {
+            if (!document.fullscreenElement) {
+                container.requestFullscreen().catch(err => {
+                    console.error(`Error attempting to enable fullscreen: ${err.message}`);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        });
+
+        document.addEventListener('touchmove', (e) => {
+            e.preventDefault();
+        }, { passive: false });
+
+        document.addEventListener('fullscreenchange', () => {
+            resizeCanvas();
+        });
+
+        window.addEventListener('orientationchange', () => {
+            setTimeout(resizeCanvas, 100);
+        });
+
+        const controls = document.querySelector('.controls');
+        document.addEventListener('fullscreenchange', () => {
+            if (document.fullscreenElement) {
+                controls.style.display = 'none';
+            } else {
+                controls.style.display = 'flex';
+            }
+        });
+
+        window.addEventListener('popstate', (event) => {
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+                history.pushState(null, '');
+            }
+        });
+
+        window.history.pushState(null, '');
+
+        // Start animation loop
+        animate();
+    </script>
+</body>
+
+</html>
